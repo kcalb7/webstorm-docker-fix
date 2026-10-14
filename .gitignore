@@ -1,0 +1,3 @@
+# Patched jars contain JetBrains code and must not be committed
+*.jar
+*.sha256

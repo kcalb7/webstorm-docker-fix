@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# Fixes the bundled Docker plugin of WebStorm 2023.1 for Docker Engine >= 29 ("client version 1.24 is too old").
+# The plugin's handshake uses a hard-coded RemoteApiVersion.VERSION_1_24; the patch swaps it for VERSION_1_40
+# (the plugin's own upper bound) and installs the patched copy in the user plugins directory.
+#
+# Usage: webstorm-docker-fix [apply|rebuild|status|undo]   (default: apply)
+#   apply    restore the backup if it matches the current build, otherwise build the patch from the bundled jar
+#   rebuild  build the patch again from the bundled jar, ignoring the backup
+#   status   show the current build, the installed plugin and the backups
+#   undo     remove the patched copy (the IDE goes back to the original plugin)
+# IDE_HOME overrides the installation (default: /snap/webstorm/current).
+set -euo pipefail
+
+IDE_HOME="${IDE_HOME:-/snap/webstorm/current}"
+BACKUP_DIR="$HOME/.local/share/webstorm-docker-fix"
+PLUGIN=clouds-docker-impl
+CLASS='com/intellij/docker/agent/impl/DockerAgentImpl$connect$2.class'
+
+info=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["buildNumber"], d["dataDirectoryName"])' "$IDE_HOME/product-info.json")
+read -r BUILD DATA_DIR <<<"$info"
+BUNDLED="$IDE_HOME/plugins/$PLUGIN/lib/$PLUGIN.jar"
+TARGET_DIR="$HOME/.local/share/JetBrains/$DATA_DIR/$PLUGIN/lib"
+TARGET="$TARGET_DIR/$PLUGIN.jar"
+BACKUP="$BACKUP_DIR/$PLUGIN-$BUILD-patched.jar"
+
+# Builds the patched jar: constant pool patch, plugin.xml version + ".1", no __index__ (IKV index with fixed offsets)
+build_patched() {
+  python3 - "$BUNDLED" "$1" "$CLASS" <<'PY'
+import re, struct, sys, zipfile
+src, dst, cls = sys.argv[1:4]
+OLD, NEW = b"VERSION_1_24", b"VERSION_1_40"
+OWNER = b"com/github/dockerjava/core/RemoteApiVersion"
+SIZES = {7: 2, 8: 2, 16: 2, 19: 2, 20: 2, 15: 3, 3: 4, 4: 4, 9: 4, 10: 4, 11: 4, 12: 4, 17: 4, 18: 4, 5: 8, 6: 8}
+
+def patch_class(data):
+    data = bytearray(data)
+    count, pos, i = struct.unpack(">H", data[8:10])[0], 10, 1
+    utf8, classes, nat, fieldrefs = {}, {}, {}, []
+    while i < count:
+        tag = data[pos]
+        if tag == 1:
+            n = struct.unpack(">H", data[pos + 1:pos + 3])[0]
+            utf8[i] = (pos + 3, bytes(data[pos + 3:pos + 3 + n]))
+            pos += 3 + n
+        else:
+            body = data[pos + 1:pos + 1 + SIZES[tag]]
+            if tag == 7: classes[i] = struct.unpack(">H", body)[0]
+            elif tag == 12: nat[i] = struct.unpack(">HH", body)
+            elif tag == 9: fieldrefs.append(struct.unpack(">HH", body))
+            pos += 1 + SIZES[tag]
+        i += 2 if tag in (5, 6) else 1
+    hits = [k for k, (_, v) in utf8.items() if v == OLD]
+    if not hits:
+        sys.exit("this build does not reference VERSION_1_24; the fix is probably not needed or not applicable")
+    assert len(hits) == 1, f"{len(hits)} occurrences of {OLD}"
+    users = [k for k, (n, _) in nat.items() if n == hits[0]]
+    assert users and hits[0] not in classes.values(), "unexpected use of the constant"
+    for u in users:
+        refs = [c for c, t in fieldrefs if t == u]
+        assert refs and all(utf8[classes[c]][1] == OWNER for c in refs), "unexpected use of the constant"
+    off = utf8[hits[0]][0]
+    data[off:off + len(OLD)] = NEW
+    return bytes(data)
+
+with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w") as zout:
+    assert NEW in zin.read("com/github/dockerjava/core/RemoteApiVersion.class"), "RemoteApiVersion has no VERSION_1_40"
+    for entry in zin.infolist():
+        if entry.filename == "__index__":
+            continue
+        data = zin.read(entry)
+        if entry.filename == cls:
+            data = patch_class(data)
+        elif entry.filename == "META-INF/plugin.xml":
+            data, n = re.subn(rb"<version>([^<]+)</version>", rb"<version>\1.1</version>", data, count=1)
+            assert n == 1, "<version> not found in plugin.xml"
+        out = zipfile.ZipInfo(entry.filename, date_time=(1980, 1, 1, 0, 0, 0))
+        out.compress_type, out.external_attr = entry.compress_type, entry.external_attr
+        zout.writestr(out, data)
+print("patched jar built")
+PY
+}
+
+# Opens the jar with the same reader the IDE uses (ImmutableZipFile) and checks the changed entries
+validate() {
+  local tmp; tmp=$(mktemp -d)
+  cat >"$tmp/ZipCheck.java" <<'JAVA'
+import java.nio.ByteBuffer;
+import java.nio.file.Path;
+public class ZipCheck {
+  public static void main(String[] a) throws Exception {
+    Object zip = Class.forName("com.intellij.util.lang.ImmutableZipFile").getMethod("load", Path.class).invoke(null, Path.of(a[0]));
+    var get = zip.getClass().getMethod("getByteBuffer", String.class);
+    get.setAccessible(true);
+    String cls = text((ByteBuffer) get.invoke(zip, a[1])), xml = text((ByteBuffer) get.invoke(zip, "META-INF/plugin.xml"));
+    if (!cls.contains("VERSION_1_40") || cls.contains("VERSION_1_24")) throw new IllegalStateException("class is not patched");
+    System.out.println("validated: " + xml.replaceAll("(?s).*?<version>([^<]*)</version>.*", "version $1") + ", handshake VERSION_1_40");
+  }
+  static String text(ByteBuffer b) { byte[] r = new byte[b.remaining()]; b.get(r); return new String(r, java.nio.charset.StandardCharsets.ISO_8859_1); }
+}
+JAVA
+  local cp="$IDE_HOME/lib/util.jar:$IDE_HOME/lib/util_rt.jar:$IDE_HOME/lib/util-8.jar:$IDE_HOME/lib/app.jar"
+  "$IDE_HOME/jbr/bin/java" -cp "$cp" "$tmp/ZipCheck.java" "$1" "$CLASS"
+  rm -rf "$tmp"
+}
+
+install_jar() {
+  mkdir -p "$TARGET_DIR"
+  cp "$1" "$TARGET.tmp" && mv "$TARGET.tmp" "$TARGET"
+  echo "installed at $TARGET"
+  echo ">> restart WebStorm to load the patched plugin"
+}
+
+rebuild() {
+  mkdir -p "$BACKUP_DIR"
+  local tmp; tmp=$(mktemp --suffix=.jar)
+  build_patched "$tmp"
+  validate "$tmp"
+  cp "$tmp" "$BACKUP"
+  sha256sum "$BACKUP" >"$BACKUP.sha256"
+  rm -f "$tmp"
+  echo "backup saved at $BACKUP"
+  install_jar "$BACKUP"
+}
+
+case "${1:-apply}" in
+  apply)
+    if [[ -f "$BACKUP" ]] && sha256sum -c --status "$BACKUP.sha256" 2>/dev/null; then
+      echo "build $BUILD: restoring backup"
+      validate "$BACKUP"
+      install_jar "$BACKUP"
+    else
+      echo "build $BUILD: no valid backup, building the patch from $BUNDLED"
+      rebuild
+    fi ;;
+  rebuild) rebuild ;;
+  status)
+    echo "WebStorm: build $BUILD ($IDE_HOME -> $(readlink -f "$IDE_HOME"))"
+    if [[ -f "$TARGET" ]]; then echo "installed: $TARGET"; validate "$TARGET" || true; else echo "installed: no (using the original plugin)"; fi
+    echo "backups:"; ls -1 "$BACKUP_DIR"/*.jar 2>/dev/null | sed 's/^/  /' || echo "  none" ;;
+  undo)
+    rm -rf "$HOME/.local/share/JetBrains/$DATA_DIR/$PLUGIN"
+    echo "patched copy removed; restart WebStorm (backups kept in $BACKUP_DIR)" ;;
+  *) sed -n '2,11p' "$0"; exit 1 ;;
+esac
